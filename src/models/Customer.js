@@ -3,7 +3,6 @@ const mongoose = require('mongoose');
 const customerSchema = new mongoose.Schema({
   name: {
     type: String,
-    required: true,
     trim: true
   },
   email: {
@@ -17,8 +16,7 @@ const customerSchema = new mongoose.Schema({
     trim: true
   },
   areaName: {
-    type: String,
-    required: true
+    type: String
   },
   partNo: {
     type: String
@@ -87,7 +85,11 @@ const customerSchema = new mongoose.Schema({
   },
   insuranceAmount: {
     type: Number,
-    default: 20.0
+    default: 0.0
+  },
+  isSubscriber: {
+    type: Boolean,
+    default: false
   },
   invoicesCount: {
     type: Number,

@@ -36,6 +36,7 @@ const formatCustomer = (customer) => {
     registrationDate: customer.registrationDate || '',
     date: customer.date || '',
     insuranceAmount: customer.insuranceAmount || 0,
+    isSubscriber: customer.isSubscriber === true || (customer.isSubscriber !== false && Number(customer.insuranceAmount || 0) >= 20),
     invoicesCount: customer.invoicesCount || 0,
     lastInvoiceDate: customer.lastInvoiceDate || '',
     freeBalance: customer.freeBalance || 0,
@@ -85,15 +86,15 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
     const {
       name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status,
       customerNo, arabicName, englishName, customDiscountRate, customerLevel, phones,
-      paciNo, addressNotes, registrationDate, date, insuranceAmount, invoicesCount,
+      paciNo, addressNotes, registrationDate, date, insuranceAmount, isSubscriber, invoicesCount,
       lastInvoiceDate, freeBalance, freeTotal, notes, branchId
     } = req.body;
 
     const primaryName = englishName || name || arabicName || 'Unnamed';
     const primaryPhone = (phones && phones[0]) || phone || '';
 
-    if (!primaryName || !primaryPhone || !areaName) {
-      return res.status(400).json({ message: 'Name, phone, and areaName are required.' });
+    if (!primaryPhone) {
+      return res.status(400).json({ message: 'Phone number is required.' });
     }
 
     const phoneToFind = primaryPhone;
@@ -105,6 +106,14 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
     });
     if (existingCustomer) {
       return res.status(400).json({ message: 'A customer with this phone number already exists.' });
+    }
+
+    // Check email uniqueness if email is provided
+    if (email && email.trim()) {
+      const existingEmail = await Customer.findOne({ email: email.trim() });
+      if (existingEmail) {
+        return res.status(400).json({ message: 'A customer with this email already exists.' });
+      }
     }
 
     const effectiveBranch = (req.activeBranch ? req.activeBranch._id : null) || branchId || req.body.branch || req.user.branch || null;
@@ -134,7 +143,8 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
       addressNotes,
       registrationDate,
       date,
-      insuranceAmount,
+      insuranceAmount: insuranceAmount || 0,
+      isSubscriber: isSubscriber !== undefined ? Boolean(isSubscriber) : Number(insuranceAmount) >= 20,
       invoicesCount,
       lastInvoiceDate,
       freeBalance,
@@ -158,7 +168,7 @@ router.put('/:id', authenticate, requirePermission('manage_customers'), async (r
       name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status,
       totalSpent, loyaltyPoints, customerNo, arabicName, englishName, customDiscountRate,
       customerLevel, phones, paciNo, addressNotes, registrationDate, date, insuranceAmount,
-      invoicesCount, lastInvoiceDate, freeBalance, freeTotal, balance, notes, branchId
+      isSubscriber, invoicesCount, lastInvoiceDate, freeBalance, freeTotal, balance, notes, branchId
     } = req.body;
 
     const customer = await Customer.findById(req.params.id);
@@ -169,13 +179,38 @@ router.put('/:id', authenticate, requirePermission('manage_customers'), async (r
     const primaryName = englishName || name || arabicName;
     const primaryPhone = (phones && phones[0]) || phone;
 
+    // Check phone uniqueness on update
+    if (primaryPhone) {
+      const existingPhone = await Customer.findOne({
+        _id: { $ne: customer._id },
+        $or: [
+          { phone: primaryPhone },
+          { phones: primaryPhone }
+        ]
+      });
+      if (existingPhone) {
+        return res.status(400).json({ message: 'A customer with this phone number already exists.' });
+      }
+    }
+
+    // Check email uniqueness on update
+    if (email && email.trim()) {
+      const existingEmail = await Customer.findOne({
+        _id: { $ne: customer._id },
+        email: email.trim()
+      });
+      if (existingEmail) {
+        return res.status(400).json({ message: 'A customer with this email already exists.' });
+      }
+    }
+
     if (primaryName) {
       customer.name = primaryName;
       customer.englishName = englishName || primaryName;
     }
     if (email !== undefined) customer.email = email;
     if (primaryPhone) customer.phone = primaryPhone;
-    if (areaName) customer.areaName = areaName;
+    if (areaName !== undefined) customer.areaName = areaName;
     if (partNo !== undefined) customer.partNo = partNo;
     if (street !== undefined) customer.street = street;
     if (jadda !== undefined) customer.jadda = jadda;
@@ -196,6 +231,14 @@ router.put('/:id', authenticate, requirePermission('manage_customers'), async (r
     if (registrationDate !== undefined) customer.registrationDate = registrationDate;
     if (date !== undefined) customer.date = date;
     if (insuranceAmount !== undefined) customer.insuranceAmount = insuranceAmount;
+    if (isSubscriber !== undefined) {
+      customer.isSubscriber = Boolean(isSubscriber);
+      if (!isSubscriber && (insuranceAmount === undefined || Number(insuranceAmount) >= 20)) {
+        customer.insuranceAmount = 0;
+      }
+    } else if (Number(customer.insuranceAmount || 0) >= 20) {
+      customer.isSubscriber = true;
+    }
     if (invoicesCount !== undefined) customer.invoicesCount = invoicesCount;
     if (lastInvoiceDate !== undefined) customer.lastInvoiceDate = lastInvoiceDate;
     if (freeBalance !== undefined) customer.freeBalance = freeBalance;

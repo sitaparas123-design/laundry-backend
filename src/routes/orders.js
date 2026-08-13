@@ -26,6 +26,7 @@ const formatOrder = (order) => {
     date: order.date,
     pickupDate: order.pickupDate || '',
     deliveryDate: order.deliveryDate || '',
+    expectedDeliveryTime: order.expectedDeliveryTime || '',
     deliveryType: order.deliveryType,
     notes: order.notes || '',
     createdBy: order.createdBy,
@@ -98,7 +99,7 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
   try {
     const {
       customerId, customerName, serviceType, amount, tax, totalAmount, discountAmount,
-      date, deliveryDate, deliveryType, notes, itemDetails, paymentStatus, paymentMethod
+      date, deliveryDate, expectedDeliveryTime, deliveryType, notes, itemDetails, paymentStatus, paymentMethod
     } = req.body;
 
     if (!customerId || !customerName || !serviceType || amount === undefined || tax === undefined || totalAmount === undefined || !itemDetails) {
@@ -164,6 +165,7 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
       amountPaid: paymentStatus === 'Paid' ? parseFloat(totalAmount) : parseFloat(req.body.amountPaid || 0.0),
       date: date || new Date().toISOString().split('T')[0],
       deliveryDate,
+      expectedDeliveryTime: expectedDeliveryTime || '',
       deliveryType: deliveryType || 'Branch Pickup',
       notes,
       createdBy: req.user.name,
@@ -449,6 +451,86 @@ router.delete('/:id', authenticate, requirePermission('manage_orders'), async (r
     res.json({ message: 'Order deleted successfully.' });
   } catch (error) {
     console.error('Delete order error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// @route   PUT /api/orders/:id/edit
+// @desc    Edit order items (admin only) — add/remove items, update quantities, recalculate totals
+router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async (req, res) => {
+  try {
+    const { itemDetails, notes, serviceType, discountAmount } = req.body;
+
+    if (!itemDetails || !Array.isArray(itemDetails) || itemDetails.length === 0) {
+      return res.status(400).json({ message: 'At least one item is required.' });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+
+    // Calculate new amounts
+    const newAmount = itemDetails.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
+    const discount = discountAmount !== undefined ? parseFloat(discountAmount) : (order.discountAmount || 0);
+    const subtotalAfterDiscount = Math.max(0, newAmount - discount);
+    // Preserve tax rate from original order
+    const originalTaxRate = order.amount > 0 ? (order.tax / order.amount) : 0;
+    const newTax = parseFloat((subtotalAfterDiscount * originalTaxRate).toFixed(3));
+    const newTotal = parseFloat((subtotalAfterDiscount + newTax).toFixed(3));
+
+    // Track old totals for customer balance adjustment
+    const oldTotal = order.totalAmount;
+    const oldAmountPaid = order.amountPaid || 0;
+
+    // Update order fields
+    order.itemDetails = itemDetails;
+    order.amount = parseFloat(newAmount.toFixed(3));
+    order.tax = newTax;
+    order.totalAmount = newTotal;
+    order.discountAmount = discount;
+    if (notes !== undefined) order.notes = notes;
+    if (serviceType) order.serviceType = serviceType;
+
+    // Adjust amountPaid if it exceeds new total
+    if (order.amountPaid > newTotal) {
+      order.amountPaid = newTotal;
+      order.paymentStatus = 'Paid';
+    }
+
+    // Add timeline entry for edit
+    const { dateStr, timeStr } = getTimelineDateTime();
+    order.timeline.push({
+      status: order.status,
+      date: dateStr,
+      time: timeStr,
+      updatedBy: req.user.name,
+      comment: `Invoice edited by admin — Items updated, Total: ${newTotal.toFixed(3)}`
+    });
+
+    await order.save();
+
+    // Adjust customer balance if payment was pending/partial
+    if (order.paymentStatus !== 'Paid') {
+      const customer = await Customer.findById(order.customer);
+      if (customer) {
+        const oldUnpaid = oldTotal - oldAmountPaid;
+        const newUnpaid = newTotal - (order.amountPaid || 0);
+        customer.balance = Math.max(0, (customer.balance || 0) - oldUnpaid + newUnpaid);
+        await customer.save();
+      }
+    }
+
+    await notify(
+      'Invoice Edited',
+      `Invoice ${order.number} was edited by ${req.user.name}. New total: ${newTotal.toFixed(3)}.`,
+      'order',
+      order.branchId || req.user.branch
+    );
+
+    res.json(formatOrder(order));
+  } catch (error) {
+    console.error('Edit order error:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

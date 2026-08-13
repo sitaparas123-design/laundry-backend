@@ -106,6 +106,9 @@ const orderSchema = new mongoose.Schema({
   deliveryDate: {
     type: String
   },
+  expectedDeliveryTime: {
+    type: String
+  },
   deliveryType: {
     type: String,
     enum: ['Branch Pickup', 'Home Delivery'],
