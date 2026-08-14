@@ -3,8 +3,6 @@ const cors = require('cors');
 
 // Import routes
 const authRoutes = require('./routes/auth');
-const authRoutes = require('./routes/auth');
-
 const branchRoutes = require('./routes/branches');
 const serviceRoutes = require('./routes/services');
 const staffRoutes = require('./routes/staff');
