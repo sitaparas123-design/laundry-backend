@@ -18,6 +18,8 @@ const formatOrder = (order) => {
     serviceType: order.serviceType,
     status: order.status,
     paymentStatus: order.paymentStatus,
+    paymentMethod: order.paymentMethod || 'Cash',
+    shift: order.shift || 'Morning',
     amount: order.amount,
     tax: order.tax,
     totalAmount: order.totalAmount,
@@ -45,6 +47,9 @@ const formatOrder = (order) => {
       updatedBy: t.updatedBy,
       comment: t.comment || ''
     })),
+    isEdited: order.isEdited || false,
+    editedAt: order.editedAt || null,
+    editedBy: order.editedBy || '',
     createdAt: order.createdAt,
     updatedAt: order.updatedAt
   };
@@ -150,6 +155,7 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
     }
 
     const { dateStr, timeStr } = getTimelineDateTime();
+    const orderShift = req.body.shift || (new Date().getHours() < 15 ? 'Morning' : 'Evening');
 
     const order = new Order({
       number: orderNumber,
@@ -158,6 +164,8 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
       serviceType,
       status: 'Waiting',
       paymentStatus: paymentStatus || 'Pending',
+      paymentMethod: paymentMethod || (paymentStatus === 'Paid' ? 'Cash' : 'Unpaid'),
+      shift: orderShift,
       amount,
       tax,
       totalAmount,
@@ -215,7 +223,11 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
         date: new Date().toISOString().split('T')[0],
         amount: parseFloat(totalAmount),
         method: paymentMethod || 'Cash',
-        status: 'Paid'
+        status: 'Paid',
+        branch: finalBranchId,
+        branchId: finalBranchId,
+        shift: orderShift,
+        createdBy: req.user.name
       });
       await payment.save();
     } else if (order.paymentStatus === 'Partial') {
@@ -244,7 +256,11 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
           date: new Date().toISOString().split('T')[0],
           amount: actualAmountPaid,
           method: paymentMethod || 'Cash',
-          status: 'Paid'
+          status: 'Paid',
+          branch: finalBranchId,
+          branchId: finalBranchId,
+          shift: orderShift,
+          createdBy: req.user.name
         });
         await payment.save();
       }
@@ -491,6 +507,10 @@ router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async 
     order.discountAmount = discount;
     if (notes !== undefined) order.notes = notes;
     if (serviceType) order.serviceType = serviceType;
+
+    order.isEdited = true;
+    order.editedAt = new Date();
+    order.editedBy = req.user.name;
 
     // Adjust amountPaid if it exceeds new total
     if (order.amountPaid > newTotal) {

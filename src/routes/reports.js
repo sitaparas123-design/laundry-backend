@@ -9,6 +9,7 @@ const User = require('../models/User');
 const Driver = require('../models/Driver');
 const Role = require('../models/Role');
 const Branch = require('../models/Branch');
+const Expense = require('../models/Expense');
 const { authenticate, requirePermission } = require('../middleware/auth');
 
 const router = express.Router();
@@ -452,15 +453,270 @@ router.get('/generate', authenticate, requirePermission('view_reports'), async (
     }
     else if (reportType === 'user_sales') {
        const orders = await Order.find(orderFilter);
+       const expenses = await Expense.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
+       const customers = await Customer.find(applyBranchFilter(req, applyDateFilter(start, end, 'createdAt')));
+
        const groups = {};
+       const getGroup = (name) => {
+         const u = name || 'Counter Staff';
+         if (!groups[u]) {
+           groups[u] = {
+             name: u,
+             count: 0,
+             sales: 0,
+             cashCollected: 0,
+             knetCollected: 0,
+             bukeyCollected: 0,
+             creditPending: 0,
+             cashExpenses: 0,
+             netCashInHand: 0,
+             newCustomers: 0,
+             subscribersAcquired: 0
+           };
+         }
+         return groups[u];
+       };
+
        orders.forEach(o => {
-         const u = o.createdBy || 'Unknown';
+         const u = o.createdBy || 'Staff';
          if (parameter && parameter !== 'All' && u !== parameter) return;
-         if (!groups[u]) groups[u] = { name: u, count: 0, sales: 0 };
-         groups[u].count += 1;
-         groups[u].sales += (o.totalAmount || 0);
+         const grp = getGroup(u);
+         grp.count += 1;
+         grp.sales += (Number(o.totalAmount) || 0);
+
+         const m = (o.paymentMethod || '').toLowerCase();
+         const isPaid = o.paymentStatus === 'Paid';
+         const isPartial = o.paymentStatus === 'Partial';
+         const paid = o.amountPaid !== undefined && o.amountPaid !== null && Number(o.amountPaid) > 0
+           ? Number(o.amountPaid)
+           : (isPaid ? Number(o.totalAmount || 0) : 0);
+         const tot = Number(o.totalAmount || 0);
+
+         if (paid > 0) {
+           if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) grp.knetCollected += paid;
+           else if (/bukey|bouquet|باقة|package|subscription/.test(m)) grp.bukeyCollected += paid;
+           else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) { /* credit */ }
+           else grp.cashCollected += paid;
+         }
+
+         if (o.paymentStatus === 'Pending' || /credit|آجل|unpaid|pending|غير مدفوع/.test(m)) {
+           grp.creditPending += (tot > paid ? tot - paid : tot);
+         } else if (isPartial && tot > paid) {
+           grp.creditPending += (tot - paid);
+         }
        });
+
+       expenses.forEach(e => {
+         const u = e.createdBy || 'Staff';
+         if (groups[u] && /cash|نقدي/i.test(e.paymentMethod || '')) {
+           groups[u].cashExpenses += (Number(e.amount) || 0);
+         }
+       });
+
+       customers.forEach(c => {
+         const u = c.createdBy || 'Counter Staff';
+         if (groups[u]) {
+           groups[u].newCustomers += 1;
+           if (c.isSubscriber || Number(c.insuranceAmount || 0) >= 20) {
+             groups[u].subscribersAcquired += 1;
+           }
+         }
+       });
+
+       Object.values(groups).forEach(g => {
+         g.netCashInHand = Math.max(0, g.cashCollected - g.cashExpenses);
+       });
+
        data = Object.values(groups);
+    }
+    else if (reportType === 'area_sales') {
+       const customers = await Customer.find(applyBranchFilter(req, {}, true));
+       const orders = await Order.find(orderFilter);
+       const areaMap = {};
+
+       customers.forEach(c => {
+         const area = (c.areaName || 'General / غير محدد').trim();
+         if (parameter && parameter !== 'All' && area !== parameter) return;
+         if (!areaMap[area]) {
+           areaMap[area] = { area, customerCount: 0, subscriberCount: 0, orderCount: 0, totalSales: 0 };
+         }
+         areaMap[area].customerCount += 1;
+         if (c.isSubscriber || Number(c.insuranceAmount || 0) >= 20) {
+           areaMap[area].subscriberCount += 1;
+         }
+       });
+
+       orders.forEach(o => {
+         const cust = customers.find(c => String(c._id) === String(o.customer) || c.name === o.customerName);
+         const area = (cust?.areaName || 'General / غير محدد').trim();
+         if (parameter && parameter !== 'All' && area !== parameter) return;
+         if (!areaMap[area]) {
+           areaMap[area] = { area, customerCount: 0, subscriberCount: 0, orderCount: 0, totalSales: 0 };
+         }
+         areaMap[area].orderCount += 1;
+         areaMap[area].totalSales += (Number(o.totalAmount) || 0);
+       });
+
+       data = Object.values(areaMap).sort((a, b) => b.totalSales - a.totalSales);
+    }
+    else if (reportType === 'shift_settlement') {
+       const orders = await Order.find(orderFilter);
+       const payments = await Payment.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
+       const expenses = await Expense.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
+
+       // Categorize by shift: Morning (before 3:00 PM), Evening (after 3:00 PM)
+       const filterByShift = (item) => {
+         if (!parameter || parameter === 'All' || parameter === 'All Day') return true;
+         if (item.shift && (item.shift === parameter || (parameter === 'Morning' && item.shift === 'Morning') || (parameter === 'Evening' && item.shift === 'Evening'))) {
+           return true;
+         }
+         const created = new Date(item.createdAt || item.date);
+         const hour = created.getHours();
+         if (parameter === 'Morning') return hour < 15;
+         if (parameter === 'Evening') return hour >= 15;
+         return true;
+       };
+
+       const shiftOrders = orders.filter(filterByShift);
+       const shiftPayments = payments.filter(filterByShift);
+       const shiftExpenses = expenses.filter(filterByShift);
+
+        let cashCollected = shiftPayments.filter(p => /cash|نقدي/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
+        let knetCollected = shiftPayments.filter(p => /k-net|knet|card|بطاقة|شبكة|link/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
+        let bukeyCollected = shiftPayments.filter(p => /bukey|bouquet|باقة|package|subscription/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
+
+        // Fallback / Synchronization: Check shiftOrders
+        if (shiftOrders.length > 0) {
+          let orderCash = 0;
+          let orderKnet = 0;
+          let orderBukey = 0;
+
+          shiftOrders.forEach(o => {
+            const m = (o.paymentMethod || '').toLowerCase();
+            const isPaid = o.paymentStatus === 'Paid';
+            const paid = o.amountPaid !== undefined && o.amountPaid !== null && Number(o.amountPaid) > 0
+              ? Number(o.amountPaid)
+              : (isPaid ? Number(o.totalAmount || 0) : 0);
+
+            if (paid > 0) {
+              if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) {
+                orderKnet += paid;
+              } else if (/bukey|bouquet|باقة|package|subscription/.test(m)) {
+                orderBukey += paid;
+              } else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) {
+                // credit / unpaid
+              } else {
+                orderCash += paid;
+              }
+            }
+          });
+
+          if (orderCash > cashCollected) cashCollected = orderCash;
+          if (orderKnet > knetCollected) knetCollected = orderKnet;
+          if (orderBukey > bukeyCollected) bukeyCollected = orderBukey;
+        }
+
+        let creditCollected = shiftOrders.reduce((sum, o) => {
+          const m = (o.paymentMethod || '').toLowerCase();
+          const isCredit = /credit|آجل|unpaid|pending|غير مدفوع/.test(m) || o.paymentStatus === 'Pending';
+          const isPartial = o.paymentStatus === 'Partial';
+          const tot = Number(o.totalAmount || 0);
+          const paid = Number(o.amountPaid || 0);
+          if (isCredit) {
+            return sum + (tot > paid ? tot - paid : tot);
+          } else if (isPartial && tot > paid) {
+            return sum + (tot - paid);
+          }
+          return sum;
+        }, 0);
+
+        const totalCollected = cashCollected + knetCollected + bukeyCollected;
+
+        const totalExpenses = shiftExpenses.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+        const cashExpenses = shiftExpenses.filter(e => /cash|نقدي/i.test(e.paymentMethod || '')).reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+
+        // Net cash in hand after deducting cash expenses
+        const netCashInHand = Math.max(0, cashCollected - cashExpenses);
+        const bankDepositAmount = netCashInHand;
+
+        const staffGroups = {};
+        shiftOrders.forEach(o => {
+          const s = o.createdBy || 'Staff';
+          if (!staffGroups[s]) {
+            staffGroups[s] = {
+              name: s,
+              count: 0,
+              sales: 0,
+              cashCollected: 0,
+              knetCollected: 0,
+              bukeyCollected: 0,
+              creditPending: 0,
+              cashExpenses: 0,
+              netCashInHand: 0
+            };
+          }
+          staffGroups[s].count += 1;
+          staffGroups[s].sales += (Number(o.totalAmount) || 0);
+
+          const m = (o.paymentMethod || '').toLowerCase();
+          const isPaid = o.paymentStatus === 'Paid';
+          const isPartial = o.paymentStatus === 'Partial';
+          const paid = o.amountPaid !== undefined && o.amountPaid !== null && Number(o.amountPaid) > 0
+            ? Number(o.amountPaid)
+            : (isPaid ? Number(o.totalAmount || 0) : 0);
+          const tot = Number(o.totalAmount || 0);
+
+          if (paid > 0) {
+            if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) staffGroups[s].knetCollected += paid;
+            else if (/bukey|bouquet|باقة|package|subscription/.test(m)) staffGroups[s].bukeyCollected += paid;
+            else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) { /* credit */ }
+            else staffGroups[s].cashCollected += paid;
+          }
+
+          if (o.paymentStatus === 'Pending' || /credit|آجل|unpaid|pending|غير مدفوع/.test(m)) {
+            staffGroups[s].creditPending += (tot > paid ? tot - paid : tot);
+          } else if (isPartial && tot > paid) {
+            staffGroups[s].creditPending += (tot - paid);
+          }
+        });
+
+        shiftExpenses.forEach(e => {
+          const s = e.createdBy || 'Staff';
+          if (staffGroups[s] && /cash|نقدي/i.test(e.paymentMethod || '')) {
+            staffGroups[s].cashExpenses += (Number(e.amount) || 0);
+          }
+        });
+
+        Object.values(staffGroups).forEach(g => {
+          g.netCashInHand = Math.max(0, g.cashCollected - g.cashExpenses);
+        });
+
+        data = [{
+          shift: parameter || 'All Day',
+          invoicesCount: shiftOrders.length,
+          totalRevenue: shiftOrders.reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+          cashCollected,
+          knetCollected,
+          bukeyCollected,
+          creditCollected,
+          cardCollected: knetCollected,
+          linkCollected: bukeyCollected,
+          totalCollected,
+          totalExpenses,
+          cashExpenses,
+          netCashInHand,
+          bankDepositAmount,
+         staffBreakdown: Object.values(staffGroups),
+         expensesBreakdown: shiftExpenses.map(e => ({
+           id: e._id,
+           title: e.title,
+           amount: e.amount,
+           category: e.category,
+           paymentMethod: e.paymentMethod,
+           time: e.time,
+           createdBy: e.createdBy
+         }))
+       }];
     }
     else if (reportType === 'driver_income') {
        let driverQuery = {};

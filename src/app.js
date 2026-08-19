@@ -16,6 +16,7 @@ const notificationRoutes = require('./routes/notifications');
 const settingRoutes = require('./routes/settings');
 const catalogRoutes = require('./routes/catalog');
 const areaRoutes = require('./routes/areas');
+const expenseRoutes = require('./routes/expenses');
 
 const app = express();
 
@@ -62,6 +63,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/settings', settingRoutes);
 app.use('/api/catalog', catalogRoutes);
 app.use('/api/areas', areaRoutes);
+app.use('/api/expenses', expenseRoutes);
 app.use('/api/reports', require('./routes/reports'));
 
 // Error Handling Middleware

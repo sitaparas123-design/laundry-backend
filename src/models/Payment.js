@@ -37,6 +37,17 @@ const paymentSchema = new mongoose.Schema({
   branch: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Branch'
+  },
+  branchId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Branch'
+  },
+  shift: {
+    type: String,
+    default: 'Morning'
+  },
+  createdBy: {
+    type: String
   }
 }, { timestamps: true });
 

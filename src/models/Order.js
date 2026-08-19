@@ -76,6 +76,14 @@ const orderSchema = new mongoose.Schema({
     enum: ['Pending', 'Paid', 'Partial', 'Overdue'],
     default: 'Pending'
   },
+  paymentMethod: {
+    type: String,
+    default: 'Cash'
+  },
+  shift: {
+    type: String,
+    default: 'Morning'
+  },
   amount: {
     type: Number,
     required: true
@@ -127,7 +135,17 @@ const orderSchema = new mongoose.Schema({
     required: true
   },
   itemDetails: [orderItemSchema],
-  timeline: [timelineNodeSchema]
+  timeline: [timelineNodeSchema],
+  isEdited: {
+    type: Boolean,
+    default: false
+  },
+  editedAt: {
+    type: Date
+  },
+  editedBy: {
+    type: String
+  }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Order', orderSchema);
