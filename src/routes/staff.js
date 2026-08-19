@@ -196,12 +196,12 @@ router.post('/', authenticate, requirePermission('manage_staff'), async (req, re
       }
     }
 
-    // Check duplicate user scoped per branch
-    const duplicateQuery = { $or: [{ email }, { username: finalUsername }] };
-    if (validBranchObjectIds.length > 0) {
-      duplicateQuery.$or.push({ branch: { $in: validBranchObjectIds } }, { branches: { $in: validBranchObjectIds } });
-    }
-    const existingUser = await User.findOne(duplicateQuery);
+    // Check duplicate user with email or username
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedUsername = finalUsername.trim();
+    const existingUser = await User.findOne({
+      $or: [{ email: normalizedEmail }, { username: normalizedUsername }]
+    });
     if (existingUser) {
       return res.status(400).json({ message: 'A user with this email or username is already assigned.' });
     }
