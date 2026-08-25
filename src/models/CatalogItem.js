@@ -5,12 +5,7 @@ const catalogItemSchema = new mongoose.Schema({
   nameAr: { type: String },
   key: { type: String, required: true, unique: true },
   price: { type: Number, required: true },
-  prices: {
-    expressIroning: { type: Number, default: 0 },
-    expressWashIron: { type: Number, default: 0 },
-    normalIroning: { type: Number, default: 0 },
-    normalWashIron: { type: Number, default: 0 }
-  },
+  prices: { type: mongoose.Schema.Types.Mixed, default: {} },
   icon: { type: String },
   category: { type: String },
   color: { type: String },

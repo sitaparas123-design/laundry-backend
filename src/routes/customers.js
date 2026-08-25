@@ -21,6 +21,7 @@ const formatCustomer = (customer) => {
     levelNo: customer.levelNo || '',
     flatNo: customer.flatNo || '',
     status: customer.status,
+    inactiveReason: customer.inactiveReason || '',
     totalSpent: customer.totalSpent,
     loyaltyPoints: customer.loyaltyPoints,
     branchId: customer.branch ? customer.branch.toString() : '',
@@ -130,6 +131,7 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
       levelNo,
       flatNo,
       status: status || 'Active',
+      inactiveReason: inactiveReason || '',
       totalSpent: 0.0,
       loyaltyPoints: 0,
       branch: effectiveBranch,
@@ -165,7 +167,7 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
 router.put('/:id', authenticate, requirePermission('manage_customers'), async (req, res) => {
   try {
     const {
-      name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status,
+      name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status, inactiveReason,
       totalSpent, loyaltyPoints, customerNo, arabicName, englishName, customDiscountRate,
       customerLevel, phones, paciNo, addressNotes, registrationDate, date, insuranceAmount,
       isSubscriber, invoicesCount, lastInvoiceDate, freeBalance, freeTotal, balance, notes, branchId
@@ -218,6 +220,7 @@ router.put('/:id', authenticate, requirePermission('manage_customers'), async (r
     if (levelNo !== undefined) customer.levelNo = levelNo;
     if (flatNo !== undefined) customer.flatNo = flatNo;
     if (status) customer.status = status;
+    if (inactiveReason !== undefined) customer.inactiveReason = inactiveReason;
     if (totalSpent !== undefined) customer.totalSpent = totalSpent;
     if (loyaltyPoints !== undefined) customer.loyaltyPoints = loyaltyPoints;
     
@@ -277,28 +280,39 @@ router.delete('/:id', authenticate, requirePermission('manage_customers'), async
 });
 
 // @route   POST /api/customers/:id/settle
-// @desc    Settle outstanding balance for a customer
-router.post('/:id/settle', authenticate, requirePermission('manage_payments'), async (req, res) => {
+// @route   POST /api/customers/:id/settle
+// @desc    Settle outstanding balance / credit payment with FIFO waterfall for a customer
+router.post('/:id/settle', authenticate, async (req, res) => {
   try {
-    const { method } = req.body;
+    const { amount, method, branchId, note } = req.body;
     const customer = await Customer.findById(req.params.id);
     if (!customer) {
       return res.status(404).json({ message: 'Customer not found.' });
     }
 
-    const settledAmount = customer.balance || 0;
-    if (settledAmount <= 0) {
-      return res.status(400).json({ message: 'Customer has no outstanding balance.' });
+    // Find all pending or partial orders for this customer (FIFO: oldest first)
+    const pendingOrders = await Order.find({
+      customer: customer._id,
+      paymentStatus: { $in: ['Pending', 'Partial'] }
+    }).sort({ createdAt: 1, date: 1 });
+
+    const totalOrdersDue = pendingOrders.reduce((sum, ord) => {
+      const paid = Number(ord.amountPaid || 0);
+      const total = Number(ord.totalAmount || 0);
+      return sum + Math.max(0, total - paid);
+    }, 0);
+
+    const custBalance = Number(customer.balance || 0);
+    const totalCurrentDue = Math.max(totalOrdersDue, custBalance);
+
+    // Determine the payment amount (custom amount if provided, or full outstanding due)
+    let paymentAmount = (amount !== undefined && amount !== null && amount !== '') ? Number(amount) : totalCurrentDue;
+
+    if (isNaN(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({ message: 'Please enter a valid payment amount greater than 0.' });
     }
 
-    // Find corresponding pending or partial orders before updating them
-    const pendingOrders = await Order.find({ customer: customer._id, paymentStatus: { $in: ['Pending', 'Partial'] } }).select('number _id totalAmount amountPaid branchId');
-
-    // Reset customer balance to 0
-    customer.balance = 0;
-    await customer.save();
-
-    // Register payments
+    // Prepare next paymentId sequence
     const latestPayment = await Payment.findOne().sort({ createdAt: -1 });
     let nextNum = 1;
     if (latestPayment && latestPayment.paymentId) {
@@ -308,66 +322,107 @@ router.post('/:id/settle', authenticate, requirePermission('manage_payments'), a
       }
     }
 
-    let remainingAmount = settledAmount;
+    let unallocated = paymentAmount;
     const createdPayments = [];
+    const settledOrdersInfo = [];
 
-    // 1. Process each pending/partial order
+    // 1. Process each pending order in FIFO sequence
     for (const order of pendingOrders) {
-      const paidAlready = order.amountPaid || 0;
-      const orderAmount = Math.max(0, (order.totalAmount || 0) - paidAlready);
-      if (orderAmount <= 0) continue;
-      
-      // Update order paymentStatus to Paid
-      order.paymentStatus = 'Paid';
-      order.amountPaid = order.totalAmount;
+      if (unallocated <= 0) break;
+
+      const paidAlready = Number(order.amountPaid || 0);
+      const orderTotal = Number(order.totalAmount || 0);
+      const orderDue = Math.max(0, orderTotal - paidAlready);
+      if (orderDue <= 0) continue;
+
+      const payForThis = Math.min(unallocated, orderDue);
+      const newPaid = paidAlready + payForThis;
+      order.amountPaid = newPaid;
+
+      if (newPaid >= orderTotal - 0.001) {
+        order.paymentStatus = 'Paid';
+      } else {
+        order.paymentStatus = 'Partial';
+      }
       await order.save();
-      
+
       const paymentId = `PAY-${String(nextNum++).padStart(4, '0')}`;
-      
       const payment = new Payment({
         paymentId,
         order: order._id,
         orderNumber: order.number,
         customerName: customer.name,
         date: new Date().toISOString().split('T')[0],
-        amount: orderAmount,
+        amount: payForThis,
         method: method || 'Cash',
         status: 'Paid',
-        branch: order.branchId || customer.branch
+        branch: branchId || order.branchId || customer.branch || (req.activeBranch && req.activeBranch._id)
       });
       await payment.save();
       createdPayments.push(payment);
-      
-      remainingAmount -= orderAmount;
+
+      settledOrdersInfo.push({
+        orderId: order._id,
+        orderNumber: order.number,
+        orderTotal,
+        amountApplied: payForThis,
+        remainingDue: Math.max(0, orderTotal - newPaid),
+        newStatus: order.paymentStatus
+      });
+
+      unallocated -= payForThis;
     }
 
-    // 2. If there is remaining balance (no pending orders, or manual adjustment), create a general balance payment
-    if (remainingAmount > 0) {
+    // 2. If excess amount paid after settling all pending orders, credit to customer's free balance / advance
+    let advanceCredited = 0;
+    if (unallocated > 0) {
+      advanceCredited = unallocated;
+      customer.freeBalance = Number(customer.freeBalance || 0) + advanceCredited;
+
       const paymentId = `PAY-${String(nextNum++).padStart(4, '0')}`;
       const payment = new Payment({
         paymentId,
-        orderNumber: `BAL-${customer._id.toString()}`,
+        orderNumber: `ADV-${customer.customerNo || customer._id.toString().slice(-4)}`,
         customerName: customer.name,
         date: new Date().toISOString().split('T')[0],
-        amount: remainingAmount,
+        amount: advanceCredited,
         method: method || 'Cash',
         status: 'Paid',
-        branch: customer.branch
+        branch: branchId || customer.branch || (req.activeBranch && req.activeBranch._id)
       });
       await payment.save();
       createdPayments.push(payment);
     }
 
+    // 3. Recalculate remaining customer outstanding balance
+    const remainingPendingOrders = await Order.find({
+      customer: customer._id,
+      paymentStatus: { $in: ['Pending', 'Partial'] }
+    });
+    const newTotalDue = remainingPendingOrders.reduce((sum, ord) => {
+      const paid = Number(ord.amountPaid || 0);
+      const total = Number(ord.totalAmount || 0);
+      return sum + Math.max(0, total - paid);
+    }, 0);
+
+    customer.balance = newTotalDue;
+    await customer.save();
+
     await notify(
       'Balance Settled',
-      `Customer ${customer.name} settled outstanding balance of ${settledAmount}.`,
+      `Customer ${customer.name} paid ${paymentAmount.toFixed(3)} KWD via ${method || 'Cash'}.`,
       'general',
-      req.user.branch
+      branchId || customer.branch || (req.activeBranch && req.activeBranch._id)
     );
 
     res.json({
-      message: `Payment of ${settledAmount} via ${method || 'Cash'} recorded successfully.`,
+      success: true,
+      message: `Payment of ${paymentAmount.toFixed(3)} KWD via ${method || 'Cash'} recorded successfully.`,
+      totalPaid: paymentAmount,
+      advanceAdded: advanceCredited,
+      newTotalDue,
       customer: formatCustomer(customer),
+      settledOrders: settledOrdersInfo,
       payments: createdPayments.map(p => ({
         id: p._id.toString(),
         paymentId: p.paymentId,
@@ -381,7 +436,7 @@ router.post('/:id/settle', authenticate, requirePermission('manage_payments'), a
     });
   } catch (error) {
     console.error('Settle customer balance error:', error);
-    res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error while settling customer balance.' });
   }
 });
 

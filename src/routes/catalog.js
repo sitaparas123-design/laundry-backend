@@ -104,13 +104,19 @@ router.put('/:key', authenticate, async (req, res) => {
     if (name !== undefined) item.name = name;
     if (nameAr !== undefined) item.nameAr = nameAr;
     if (price !== undefined) item.price = price;
-    if (prices !== undefined) item.prices = prices;
+    if (prices !== undefined) {
+      item.prices = prices;
+      item.markModified('prices');
+    }
     if (icon !== undefined) item.icon = icon;
     if (category !== undefined) item.category = category;
     if (color !== undefined) item.color = color;
     if (image !== undefined) item.image = image;
     if (hasSizes !== undefined) item.hasSizes = hasSizes;
-    if (sizes !== undefined) item.sizes = sizes;
+    if (sizes !== undefined) {
+      item.sizes = sizes;
+      item.markModified('sizes');
+    }
 
     await item.save();
     res.json(item);

@@ -66,6 +66,75 @@ const getTimelineDateTime = () => {
   return { dateStr, timeStr };
 };
 
+// @route   GET /api/orders/public/:idOrNumber
+// @desc    Get order details by order number or MongoDB ID for public receipt scanning (no auth required)
+router.get('/public/:idOrNumber', async (req, res) => {
+  try {
+    const rawParam = decodeURIComponent(req.params.idOrNumber || '').trim();
+    if (!rawParam) {
+      return res.status(400).json({ message: 'Order number or ID is required' });
+    }
+
+    // 1. Try exact number match
+    let order = await Order.findOne({ number: rawParam });
+
+    // 2. Try case-insensitive regex
+    if (!order) {
+      const escaped = rawParam.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      order = await Order.findOne({
+        number: { $regex: new RegExp(`^${escaped}$`, 'i') }
+      });
+    }
+
+    // 3. Try MongoDB _id match
+    if (!order && /^[0-9a-fA-F]{24}$/.test(rawParam)) {
+      order = await Order.findById(rawParam);
+    }
+
+    // 4. Try suffix match (e.g. MIS-064 vs 064 or 64)
+    if (!order) {
+      const numericMatch = rawParam.match(/(\d+)/);
+      if (numericMatch) {
+        order = await Order.findOne({
+          number: { $regex: new RegExp(`MIS-0*${numericMatch[1]}$`, 'i') }
+        });
+      }
+    }
+
+    if (!order) {
+      return res.status(404).json({ message: 'Invoice not found' });
+    }
+
+    // Fetch customer details if available
+    let customerObj = null;
+    if (order.customer) {
+      customerObj = await Customer.findById(order.customer).lean();
+    }
+
+    // Fetch branch details if available
+    let branchObj = null;
+    if (order.branchId) {
+      branchObj = await Branch.findById(order.branchId).lean();
+    }
+
+    const formatted = formatOrder(order);
+    if (customerObj) {
+      formatted.customerPhone = customerObj.phone || (customerObj.phones && customerObj.phones[0]) || '';
+      formatted.customerNo = customerObj.customerNo || '';
+      formatted.isSubscriber = customerObj.isSubscriber === true || (customerObj.isSubscriber !== false && Number(customerObj.insuranceAmount || 0) >= 20);
+    }
+    if (branchObj) {
+      formatted.branchName = branchObj.name;
+      formatted.branchNameAr = branchObj.nameAr;
+    }
+
+    res.json(formatted);
+  } catch (error) {
+    console.error('Public receipt lookup error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // @route   GET /api/orders
 // @desc    Get orders with optional filters (branchId, status)
 router.get('/', authenticate, async (req, res) => {
@@ -114,6 +183,14 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
     const customer = await Customer.findById(customerId);
     if (!customer) {
       return res.status(404).json({ message: 'Customer not found.' });
+    }
+
+    if (customer.status === 'Inactive') {
+      const reason = customer.inactiveReason || 'Account is suspended';
+      return res.status(400).json({
+        message: `Cannot create invoice. Customer is Inactive (سبب الإيقاف: ${reason})`,
+        inactiveReason: reason
+      });
     }
 
     // Generate unique order number (prevent collision)
@@ -552,6 +629,92 @@ router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async 
   } catch (error) {
     console.error('Edit order error:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// @route   GET /api/orders/purge-preview
+// @desc    Preview invoices older than specified years (default 2 years)
+router.get('/purge-preview', authenticate, requirePermission('manage_settings'), async (req, res) => {
+  try {
+    const years = parseFloat(req.query.years) || 2;
+    const cutoffDate = new Date(Date.now() - years * 365.25 * 24 * 60 * 60 * 1000);
+    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+
+    const eligibleOrders = await Order.find({
+      $or: [
+        { createdAt: { $lte: cutoffDate } },
+        { date: { $lte: cutoffDateStr } }
+      ]
+    }).sort({ createdAt: -1 });
+
+    const totalAmount = eligibleOrders.reduce((sum, o) => sum + (Number(o.totalAmount) || 0), 0);
+
+    res.json({
+      cutoffDate: cutoffDateStr,
+      years,
+      eligibleCount: eligibleOrders.length,
+      totalAmount,
+      orders: eligibleOrders.slice(0, 50).map(formatOrder)
+    });
+  } catch (error) {
+    console.error('Purge preview error:', error);
+    res.status(500).json({ message: 'Failed to generate purge preview' });
+  }
+});
+
+// @route   POST /api/orders/purge-old-invoices
+// @desc    Safely delete invoices older than specified years (default 2 years)
+router.post('/purge-old-invoices', authenticate, requirePermission('manage_settings'), async (req, res) => {
+  try {
+    const years = parseFloat(req.body.years) || 2;
+    const cutoffDate = new Date(Date.now() - years * 365.25 * 24 * 60 * 60 * 1000);
+    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+
+    // Find target orders
+    const targetOrders = await Order.find({
+      $or: [
+        { createdAt: { $lte: cutoffDate } },
+        { date: { $lte: cutoffDateStr } }
+      ]
+    });
+
+    const targetOrderIds = targetOrders.map(o => o._id);
+    const targetOrderNumbers = targetOrders.map(o => o.number);
+
+    if (targetOrderIds.length === 0) {
+      return res.json({
+        message: 'No invoices found older than 2 years.',
+        deletedCount: 0
+      });
+    }
+
+    // Delete orders
+    const deleteOrdersResult = await Order.deleteMany({ _id: { $in: targetOrderIds } });
+
+    // Also delete associated payments
+    await Payment.deleteMany({
+      $or: [
+        { order: { $in: targetOrderIds } },
+        { orderNumber: { $in: targetOrderNumbers } },
+        { createdAt: { $lte: cutoffDate } }
+      ]
+    });
+
+    // Notify audit
+    await notify(
+      'Invoices Purged (2 Years)',
+      `${req.user.name} purged ${deleteOrdersResult.deletedCount} invoices created before ${cutoffDateStr}.`,
+      'system'
+    );
+
+    res.json({
+      message: `Successfully purged ${deleteOrdersResult.deletedCount} invoices older than ${years} years.`,
+      deletedCount: deleteOrdersResult.deletedCount,
+      cutoffDate: cutoffDateStr
+    });
+  } catch (error) {
+    console.error('Purge old invoices error:', error);
+    res.status(500).json({ message: 'Failed to purge old invoices' });
   }
 });
 
