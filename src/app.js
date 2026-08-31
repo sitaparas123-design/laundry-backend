@@ -28,7 +28,7 @@ const allowedOrigins = [
   'http://localhost:5000'
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.netlify.app')) {
       callback(null, true);
@@ -37,9 +37,13 @@ app.use(cors({
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-selected-branch', 'X-Selected-Branch', 'Accept', 'X-Requested-With'],
-  credentials: true
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-selected-branch', 'X-Selected-Branch', 'Accept', 'X-Requested-With', 'Origin'],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
