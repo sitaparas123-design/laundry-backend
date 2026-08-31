@@ -85,7 +85,7 @@ router.get('/', authenticate, async (req, res) => {
 router.post('/', authenticate, requirePermission('manage_customers'), async (req, res) => {
   try {
     const {
-      name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status,
+      name, email, phone, areaName, partNo, street, jadda, houseNo, levelNo, flatNo, status, inactiveReason,
       customerNo, arabicName, englishName, customDiscountRate, customerLevel, phones,
       paciNo, addressNotes, registrationDate, date, insuranceAmount, isSubscriber, invoicesCount,
       lastInvoiceDate, freeBalance, freeTotal, notes, branchId
@@ -121,7 +121,7 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
 
     const customer = new Customer({
       name: primaryName,
-      email,
+      email: (email && email.trim()) || undefined,
       phone: primaryPhone,
       areaName,
       partNo,
@@ -158,7 +158,15 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
     res.status(201).json(formatCustomer(customer));
   } catch (error) {
     console.error('Create customer error:', error);
-    res.status(500).json({ message: 'Internal server error' });
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(val => val.message);
+      return res.status(400).json({ message: messages.join(', ') });
+    }
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyValue || {})[0] || 'field';
+      return res.status(400).json({ message: `Customer with this ${field} already exists.` });
+    }
+    res.status(500).json({ message: error.message || 'Internal server error' });
   }
 });
 
