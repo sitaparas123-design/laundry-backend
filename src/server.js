@@ -13,6 +13,10 @@ const startServer = async () => {
   const seedAreas = require('./utils/seedAreas');
   await seedAreas();
 
+  // Self-Healing: Seed & Protect System Core Branches (Home Service, Main Branch)
+  const seedBranches = require('./utils/seedBranches');
+  await seedBranches();
+
   // Listen
   app.listen(PORT, () => {
     console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);

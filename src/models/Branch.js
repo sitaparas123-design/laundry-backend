@@ -25,6 +25,10 @@ const branchSchema = new mongoose.Schema({
     type: String,
     enum: ['Active', 'Inactive'],
     default: 'Active'
+  },
+  isSystemBranch: {
+    type: Boolean,
+    default: false
   }
 }, { timestamps: true });
 
