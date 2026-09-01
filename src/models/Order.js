@@ -100,6 +100,10 @@ const orderSchema = new mongoose.Schema({
     type: Number,
     default: 0.0
   },
+  freeBalanceUsed: {
+    type: Number,
+    default: 0.0
+  },
   amountPaid: {
     type: Number,
     default: 0.0
@@ -136,6 +140,23 @@ const orderSchema = new mongoose.Schema({
   },
   itemDetails: [orderItemSchema],
   timeline: [timelineNodeSchema],
+  sharedBranches: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Branch'
+  }],
+  transferredTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Branch'
+  },
+  transferredBranchName: {
+    type: String
+  },
+  transferredAt: {
+    type: Date
+  },
+  transferredBy: {
+    type: String
+  },
   isEdited: {
     type: Boolean,
     default: false

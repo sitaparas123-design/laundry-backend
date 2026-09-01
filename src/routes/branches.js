@@ -12,12 +12,13 @@ const seedBranches = require('../utils/seedBranches');
 const formatBranch = (branch) => {
   const isSys = Boolean(
     branch.isSystemBranch ||
-    (branch.name && branch.name.toLowerCase().includes('home service')) ||
-    (branch.name && branch.name.toLowerCase().includes('main branch'))
+    (branch.name && branch.name.toLowerCase().includes('home service'))
   );
   return {
     id: branch._id.toString(),
     name: branch.name,
+    nameAr: branch.nameAr || branch.arabicName || '',
+    arabicName: branch.arabicName || branch.nameAr || '',
     address: branch.address,
     phone: branch.phone,
     email: branch.email || '',
@@ -33,10 +34,13 @@ const formatBranch = (branch) => {
 // @desc    Get active branches for public dropdowns (like Login)
 router.get('/public', async (req, res) => {
   try {
+    await Branch.deleteMany({ name: { $regex: /main branch/i } });
     const branches = await Branch.find({ status: 'Active' }).sort({ name: 1 });
     const formatted = branches.map(branch => ({
       id: branch._id.toString(),
-      name: branch.name
+      name: branch.name,
+      nameAr: branch.nameAr || branch.arabicName || '',
+      arabicName: branch.arabicName || branch.nameAr || ''
     }));
     res.json(formatted);
   } catch (error) {
@@ -46,13 +50,13 @@ router.get('/public', async (req, res) => {
 });
 
 // @route   POST /api/branches/restore-system-branches
-// @desc    Auto-seed / Restore missing core system branches (Home Service, Main Branch)
+// @desc    Auto-seed / Restore missing core system branches (Home Service)
 router.post('/restore-system-branches', authenticate, requirePermission('manage_settings'), async (req, res) => {
   try {
     await seedBranches();
     const branches = await Branch.find().sort({ createdAt: -1 });
     const formatted = branches.map(branch => formatBranch(branch));
-    res.json({ message: 'Core system branches verified and restored successfully.', branches: formatted });
+    res.json({ message: 'Core system branches verified successfully.', branches: formatted });
   } catch (error) {
     console.error('Restore system branches error:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -63,6 +67,9 @@ router.post('/restore-system-branches', authenticate, requirePermission('manage_
 // @desc    Get all branches with populated assigned Admin name
 router.get('/', authenticate, async (req, res) => {
   try {
+    // Permanently remove Main Branch from database
+    await Branch.deleteMany({ name: { $regex: /main branch/i } });
+
     const adminRole = await Role.findOne({ name: 'Admin' });
     const admins = adminRole ? await User.find({ role: adminRole._id }) : [];
 
@@ -87,7 +94,7 @@ router.get('/', authenticate, async (req, res) => {
 // @desc    Create a branch
 router.post('/', authenticate, requirePermission('manage_settings'), async (req, res) => {
   try {
-    const { name, address, phone, email, manager, status } = req.body;
+    const { name, nameAr, arabicName, address, phone, email, manager, status } = req.body;
 
     if (!name || !address || !phone) {
       return res.status(400).json({ message: 'Name, address, and phone are required.' });
@@ -98,10 +105,13 @@ router.post('/', authenticate, requirePermission('manage_settings'), async (req,
       return res.status(400).json({ message: 'A branch with this name already exists.' });
     }
 
-    const isSys = name.toLowerCase().includes('home service') || name.toLowerCase().includes('main branch');
+    const isSys = name.toLowerCase().includes('home service');
+    const arName = (nameAr || arabicName || '').trim();
 
     const branch = new Branch({
       name: name.trim(),
+      nameAr: arName,
+      arabicName: arName,
       address,
       phone,
       email: email || '',
@@ -122,7 +132,7 @@ router.post('/', authenticate, requirePermission('manage_settings'), async (req,
 // @desc    Update a branch
 router.put('/:id', authenticate, requirePermission('manage_settings'), async (req, res) => {
   try {
-    const { name, address, phone, email, manager, status } = req.body;
+    const { name, nameAr, arabicName, address, phone, email, manager, status } = req.body;
     
     const branch = await Branch.findById(req.params.id);
     if (!branch) {
@@ -132,10 +142,15 @@ router.put('/:id', authenticate, requirePermission('manage_settings'), async (re
     if (name) {
       // If it is a system branch, preserve core identity
       const isCurrentSystem = branch.isSystemBranch || branch.name.toLowerCase().includes('home service');
-      if (isCurrentSystem && !name.toLowerCase().includes('home service') && !name.toLowerCase().includes('main')) {
+      if (isCurrentSystem && !name.toLowerCase().includes('home service')) {
         return res.status(400).json({ message: 'Cannot rename protected system core branch to an arbitrary name.' });
       }
       branch.name = name.trim();
+    }
+    if (nameAr !== undefined || arabicName !== undefined) {
+      const arName = (nameAr !== undefined ? nameAr : arabicName || '').trim();
+      branch.nameAr = arName;
+      branch.arabicName = arName;
     }
     if (address) branch.address = address;
     if (phone) branch.phone = phone;
@@ -152,7 +167,7 @@ router.put('/:id', authenticate, requirePermission('manage_settings'), async (re
 });
 
 // @route   DELETE /api/branches/:id
-// @desc    Delete a branch (Protected System Branches cannot be deleted)
+// @desc    Delete a branch
 router.delete('/:id', authenticate, requirePermission('manage_settings'), async (req, res) => {
   try {
     const branch = await Branch.findById(req.params.id);
@@ -160,11 +175,10 @@ router.delete('/:id', authenticate, requirePermission('manage_settings'), async 
       return res.status(404).json({ message: 'Branch not found' });
     }
 
-    // Protection check for Home Service and Main Branch
+    // Protection check for Home Service
     const isProtected = Boolean(
       branch.isSystemBranch ||
-      (branch.name && branch.name.toLowerCase().includes('home service')) ||
-      (branch.name && branch.name.toLowerCase().includes('main branch'))
+      (branch.name && branch.name.toLowerCase().includes('home service'))
     );
 
     if (isProtected) {

@@ -16,11 +16,22 @@ const formatService = (service) => {
   };
 };
 
+const getServiceSortOrder = (name) => {
+  const n = String(name || '').toLowerCase().trim();
+  if (n === 'normal ironing' || n === 'iron only' || n === 'ironing') return 1;
+  if (n === 'wash & iron' || n === 'wash and iron' || n === 'normal wash & iron') return 2;
+  if (n === 'express ironing' || n === 'express iron') return 3;
+  if (n === 'express wash & iron' || n === 'express wash and iron') return 4;
+  if (!n.includes('express') && !n.includes('urgent')) return 2.5;
+  return 5;
+};
+
 // @route   GET /api/services
 // @desc    Get all services
 router.get('/', authenticate, async (req, res) => {
   try {
-    const services = await LaundryService.find().sort({ createdAt: -1 });
+    const services = await LaundryService.find();
+    services.sort((a, b) => getServiceSortOrder(a.name) - getServiceSortOrder(b.name));
     res.json(services.map(formatService));
   } catch (error) {
     console.error('Get services error:', error);

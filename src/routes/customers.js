@@ -26,7 +26,7 @@ const formatCustomer = (customer) => {
     loyaltyPoints: customer.loyaltyPoints,
     branchId: customer.branch ? customer.branch.toString() : '',
     branch: customer.branch ? customer.branch.toString() : '',
-    customerNo: customer.customerNo || '',
+    customerNo: (customer.customerNo && customer.customerNo !== 'Auto-generated') ? customer.customerNo : (customer._id ? String(customer._id).slice(-4) : ''),
     arabicName: customer.arabicName || '',
     englishName: customer.englishName || '',
     customDiscountRate: customer.customDiscountRate || 0,
@@ -119,6 +119,20 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
 
     const effectiveBranch = (req.activeBranch ? req.activeBranch._id : null) || branchId || req.body.branch || req.user.branch || null;
 
+    let finalCustomerNo = customerNo;
+    if (!finalCustomerNo || String(finalCustomerNo).trim() === '' || String(finalCustomerNo).toLowerCase() === 'auto-generated') {
+      const branchFilter = effectiveBranch ? { branch: effectiveBranch } : {};
+      const branchCustomers = await Customer.find(branchFilter, 'customerNo');
+      let maxNum = 0;
+      branchCustomers.forEach(c => {
+        const num = parseInt(c.customerNo, 10);
+        if (!isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      });
+      finalCustomerNo = String(maxNum + 1);
+    }
+
     const customer = new Customer({
       name: primaryName,
       email: (email && email.trim()) || undefined,
@@ -135,7 +149,7 @@ router.post('/', authenticate, requirePermission('manage_customers'), async (req
       totalSpent: 0.0,
       loyaltyPoints: 0,
       branch: effectiveBranch,
-      customerNo,
+      customerNo: finalCustomerNo,
       arabicName,
       englishName: englishName || primaryName,
       customDiscountRate,

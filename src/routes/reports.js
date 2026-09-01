@@ -10,6 +10,7 @@ const Driver = require('../models/Driver');
 const Role = require('../models/Role');
 const Branch = require('../models/Branch');
 const Expense = require('../models/Expense');
+const LaundryService = require('../models/LaundryService');
 const { authenticate, requirePermission } = require('../middleware/auth');
 
 const router = express.Router();
@@ -45,17 +46,29 @@ const applyDateFilter = (start, end, dateField = 'date', baseFilter = {}) => {
   return filter;
 };
 
-// Helper to categorize service revenue based on frontend logic keywords
-const categorizeService = (serviceType, amount) => {
-  const name = (serviceType || '').toLowerCase();
-  const premium = ['premium', 'silk', 'wool', 'wedding', 'leather', 'stain'];
-  const dry = ['dry clean'];
-  const iron = ['iron', 'pressing', 'press'];
-
-  if (premium.some(k => name.includes(k))) return { cat: 'Premium', val: amount };
-  if (dry.some(k => name.includes(k))) return { cat: 'Dry Clean', val: amount };
-  if (iron.some(k => name.includes(k))) return { cat: 'Ironing', val: amount };
-  return { cat: 'Washing', val: amount };
+// Helper to normalize and map service names to official Laundry Services
+const normalizeServiceName = (serviceType, dbServices = []) => {
+  const s = String(serviceType || '').toLowerCase().trim();
+  if (s.includes('express') && (s.includes('iron') || s.includes('press')) && (s.includes('wash') || s.includes('fold'))) {
+    return 'Express Wash & Iron';
+  }
+  if (s.includes('express') && (s.includes('wash') || s.includes('fold'))) {
+    return 'Express Wash & Iron';
+  }
+  if (s.includes('express') && (s.includes('iron') || s.includes('press'))) {
+    return 'Express Ironing';
+  }
+  if (s.includes('wash') || s.includes('fold') || s.includes('normal wash')) {
+    return 'Wash & Iron';
+  }
+  if (s.includes('iron') || s.includes('press')) {
+    return 'Normal Ironing';
+  }
+  if (dbServices && dbServices.length > 0) {
+    const matched = dbServices.find(dbS => (dbS.name || '').toLowerCase() === s);
+    if (matched) return matched.name;
+  }
+  return serviceType || 'Wash & Iron';
 };
 
 // @route   GET /api/reports/dashboard
@@ -76,6 +89,7 @@ router.get('/dashboard', authenticate, requirePermission('view_reports'), async 
     const pickups = await Pickup.find(pickupFilter);
     const deliveries = await Delivery.find(deliveryFilter);
     const users = await User.find(applyBranchFilter(req, {}, true)).populate('role');
+    const dbServices = await LaundryService.find();
     
     const totalRevenue = orders.reduce((sum, o) => sum + (o.totalAmount || o.amount || 0), 0);
     const totalOrders = orders.length;
@@ -87,32 +101,109 @@ router.get('/dashboard', authenticate, requirePermission('view_reports'), async 
     const activeCustomers = customers.filter(c => c.status === 'Active').length;
     const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
     
-    // Service Revenue Dist
-    const serviceRevenue = { washing: 0, dryCleaning: 0, ironing: 0, premium: 0 };
-    orders.forEach(o => {
-      const res = categorizeService(o.serviceType, o.totalAmount || o.amount || 0);
-      if (res.cat === 'Premium') serviceRevenue.premium += res.val;
-      else if (res.cat === 'Dry Clean') serviceRevenue.dryCleaning += res.val;
-      else if (res.cat === 'Ironing') serviceRevenue.ironing += res.val;
-      else serviceRevenue.washing += res.val;
+    // Dynamic Service Revenue & Counts from DB Services
+    const serviceRevenue = {};
+    const defaultServices = dbServices.length > 0
+      ? dbServices.map(s => s.name)
+      : ['Normal Ironing', 'Wash & Iron', 'Express Ironing', 'Express Wash & Iron'];
+      
+    defaultServices.forEach(name => {
+      serviceRevenue[name] = 0;
     });
 
-    // Payment Distribution
-    const paymentDistribution = { Cash: 0, Card: 0, Link: 0, Wamd: 0 };
+    orders.forEach(o => {
+      const sName = normalizeServiceName(o.serviceType || o.service, dbServices);
+      const val = o.totalAmount || o.amount || 0;
+      serviceRevenue[sName] = (serviceRevenue[sName] || 0) + val;
+    });
+
+    // Helper to normalize payment methods
+    const normalizePaymentMethod = (method) => {
+      const m = String(method || '').toLowerCase().trim();
+      if (m === 'k-net' || m === 'knet' || m === 'card' || m === 'بطاقة' || m === 'شبكة') return 'K-Net';
+      if (m === 'bukey' || m === 'bouquet' || m === 'باقة' || m === 'باقات' || m === 'package' || m === 'subscription') return 'Bukey';
+      if (m === 'credit' || m === 'آجل' || m === 'ذمم' || m === 'unpaid' || m === 'غير مدفوع' || m === 'pending') return 'Credit';
+      if (m === 'link' || m === 'رابط') return 'Link';
+      return 'Cash';
+    };
+
+    // Real Payment Distribution from orders & payments in period
+    const paymentDistribution = {
+      Cash: 0,
+      'K-Net': 0,
+      Bukey: 0,
+      Credit: 0
+    };
+
+    orders.forEach(o => {
+      const isPaid = o.paymentStatus === 'Paid';
+      const m = o.paymentMethod || (isPaid ? 'Cash' : 'Credit');
+      const normMethod = normalizePaymentMethod(m);
+      const amount = Number(o.totalAmount || o.amount || 0);
+      if (paymentDistribution[normMethod] !== undefined) {
+        paymentDistribution[normMethod] += amount;
+      } else {
+        paymentDistribution[normMethod] = amount;
+      }
+    });
+
     payments.forEach(p => {
-      if (paymentDistribution[p.method] !== undefined) {
-        paymentDistribution[p.method] += (p.amount || 0);
+      const isAlreadyInOrders = p.order && orders.some(o => o._id.toString() === p.order.toString());
+      if (!isAlreadyInOrders) {
+        const normMethod = normalizePaymentMethod(p.method);
+        const amount = Number(p.amount || 0);
+        if (paymentDistribution[normMethod] !== undefined) {
+          paymentDistribution[normMethod] += amount;
+        } else {
+          paymentDistribution[normMethod] = amount;
+        }
       }
     });
 
     // Payment method breakdown object
     const paymentMethodBreakdown = { ...paymentDistribution };
 
-    // Order status breakdown object
-    const orderStatusBreakdown = {};
+    // Order status breakdown object with official system statuses
+    const orderStatusBreakdown = {
+      Waiting: 0,
+      'Preparing in shop': 0,
+      'Preparing in workshop': 0,
+      Hold: 0,
+      Ready: 0,
+      'Ready for delivery': 0,
+      'Ready for shop': 0,
+      'With Driver': 0,
+      Delivered: 0,
+      Return: 0,
+      Store: 0
+    };
+
+    const normalizeOrderStatus = (status) => {
+      const s = String(status || '').trim();
+      const legacyMap = {
+        Received: 'Waiting',
+        'In Workshop': 'Preparing in workshop',
+        'In Shop': 'Preparing in shop',
+        'On Hold': 'Hold',
+        'In Store': 'Store',
+        'H Services': 'Ready for delivery',
+        Cancel: 'Return',
+        Cancelled: 'Return',
+        Washing: 'Preparing in shop',
+        Drying: 'Preparing in workshop',
+        Ironing: 'Preparing in workshop',
+      };
+      return legacyMap[s] || s;
+    };
+
     orders.forEach(o => {
       if (o.status) {
-        orderStatusBreakdown[o.status] = (orderStatusBreakdown[o.status] || 0) + 1;
+        const norm = normalizeOrderStatus(o.status);
+        if (orderStatusBreakdown[norm] !== undefined) {
+          orderStatusBreakdown[norm] += 1;
+        } else {
+          orderStatusBreakdown[norm] = 1;
+        }
       }
     });
 
@@ -560,163 +651,145 @@ router.get('/generate', authenticate, requirePermission('view_reports'), async (
        data = Object.values(areaMap).sort((a, b) => b.totalSales - a.totalSales);
     }
     else if (reportType === 'shift_settlement') {
-       const orders = await Order.find(orderFilter);
-       const payments = await Payment.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
-       const expenses = await Expense.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
+        const orders = await Order.find(orderFilter);
+        const payments = await Payment.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
+        const expenses = await Expense.find(applyBranchFilter(req, applyDateFilter(start, end, 'date')));
 
-       // Categorize by shift: Morning (before 3:00 PM), Evening (after 3:00 PM)
-       const filterByShift = (item) => {
-         if (!parameter || parameter === 'All' || parameter === 'All Day') return true;
-         if (item.shift && (item.shift === parameter || (parameter === 'Morning' && item.shift === 'Morning') || (parameter === 'Evening' && item.shift === 'Evening'))) {
-           return true;
-         }
-         const created = new Date(item.createdAt || item.date);
-         const hour = created.getHours();
-         if (parameter === 'Morning') return hour < 15;
-         if (parameter === 'Evening') return hour >= 15;
-         return true;
-       };
+        // Helper to determine shift from timestamp: Morning (< 3 PM / 15:00), Evening (>= 3 PM / 15:00)
+        const getItemShift = (item) => {
+          if (item.shift === 'Morning' || item.shift === 'Evening') return item.shift;
+          const created = new Date(item.createdAt || item.date);
+          const hour = created.getHours();
+          return hour < 15 ? 'Morning' : 'Evening';
+        };
 
-       const shiftOrders = orders.filter(filterByShift);
-       const shiftPayments = payments.filter(filterByShift);
-       const shiftExpenses = expenses.filter(filterByShift);
+        // Filter items if user selected Morning or Evening specifically
+        const filterByShiftParam = (item) => {
+          if (!parameter || parameter === 'All' || parameter === 'All Day') return true;
+          return getItemShift(item) === parameter;
+        };
 
-        let cashCollected = shiftPayments.filter(p => /cash|نقدي/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
-        let knetCollected = shiftPayments.filter(p => /k-net|knet|card|بطاقة|شبكة|link/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
-        let bukeyCollected = shiftPayments.filter(p => /bukey|bouquet|باقة|package|subscription/i.test(p.method || '')).reduce((sum, p) => sum + (p.amount || 0), 0);
+        const filteredOrders = orders.filter(filterByShiftParam);
+        const filteredPayments = payments.filter(filterByShiftParam);
+        const filteredExpenses = expenses.filter(filterByShiftParam);
 
-        // Fallback / Synchronization: Check shiftOrders
-        if (shiftOrders.length > 0) {
-          let orderCash = 0;
-          let orderKnet = 0;
-          let orderBukey = 0;
+        // Group orders by shift and staff
+        // Key: `${shift}_${staffName}`
+        const groups = {};
 
-          shiftOrders.forEach(o => {
-            const m = (o.paymentMethod || '').toLowerCase();
-            const isPaid = o.paymentStatus === 'Paid';
-            const paid = o.amountPaid !== undefined && o.amountPaid !== null && Number(o.amountPaid) > 0
-              ? Number(o.amountPaid)
-              : (isPaid ? Number(o.totalAmount || 0) : 0);
+        filteredOrders.forEach((o) => {
+          const shift = getItemShift(o);
+          const staffName = o.createdBy || o.staffName || 'Counter Staff';
+          const groupKey = `${shift}___${staffName}`;
 
-            if (paid > 0) {
-              if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) {
-                orderKnet += paid;
-              } else if (/bukey|bouquet|باقة|package|subscription/.test(m)) {
-                orderBukey += paid;
-              } else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) {
-                // credit / unpaid
-              } else {
-                orderCash += paid;
-              }
-            }
-          });
-
-          if (orderCash > cashCollected) cashCollected = orderCash;
-          if (orderKnet > knetCollected) knetCollected = orderKnet;
-          if (orderBukey > bukeyCollected) bukeyCollected = orderBukey;
-        }
-
-        let creditCollected = shiftOrders.reduce((sum, o) => {
-          const m = (o.paymentMethod || '').toLowerCase();
-          const isCredit = /credit|آجل|unpaid|pending|غير مدفوع/.test(m) || o.paymentStatus === 'Pending';
-          const isPartial = o.paymentStatus === 'Partial';
-          const tot = Number(o.totalAmount || 0);
-          const paid = Number(o.amountPaid || 0);
-          if (isCredit) {
-            return sum + (tot > paid ? tot - paid : tot);
-          } else if (isPartial && tot > paid) {
-            return sum + (tot - paid);
-          }
-          return sum;
-        }, 0);
-
-        const totalCollected = cashCollected + knetCollected + bukeyCollected;
-
-        const totalExpenses = shiftExpenses.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
-        const cashExpenses = shiftExpenses.filter(e => /cash|نقدي/i.test(e.paymentMethod || '')).reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
-
-        // Net cash in hand after deducting cash expenses
-        const netCashInHand = Math.max(0, cashCollected - cashExpenses);
-        const bankDepositAmount = netCashInHand;
-
-        const staffGroups = {};
-        shiftOrders.forEach(o => {
-          const s = o.createdBy || 'Staff';
-          if (!staffGroups[s]) {
-            staffGroups[s] = {
-              name: s,
-              count: 0,
-              sales: 0,
+          if (!groups[groupKey]) {
+            groups[groupKey] = {
+              shiftKey: shift,
+              shift: shift === 'Morning' ? 'Morning' : 'Evening',
+              staffName: staffName,
+              invoicesCount: 0,
+              totalRevenue: 0,
               cashCollected: 0,
               knetCollected: 0,
               bukeyCollected: 0,
-              creditPending: 0,
+              creditCollected: 0,
               cashExpenses: 0,
-              netCashInHand: 0
+              netCashInHand: 0,
             };
           }
-          staffGroups[s].count += 1;
-          staffGroups[s].sales += (Number(o.totalAmount) || 0);
+
+          groups[groupKey].invoicesCount += 1;
+          const tot = Number(o.totalAmount || 0);
+          groups[groupKey].totalRevenue += tot;
 
           const m = (o.paymentMethod || '').toLowerCase();
           const isPaid = o.paymentStatus === 'Paid';
           const isPartial = o.paymentStatus === 'Partial';
           const paid = o.amountPaid !== undefined && o.amountPaid !== null && Number(o.amountPaid) > 0
             ? Number(o.amountPaid)
-            : (isPaid ? Number(o.totalAmount || 0) : 0);
-          const tot = Number(o.totalAmount || 0);
+            : (isPaid ? tot : 0);
 
           if (paid > 0) {
-            if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) staffGroups[s].knetCollected += paid;
-            else if (/bukey|bouquet|باقة|package|subscription/.test(m)) staffGroups[s].bukeyCollected += paid;
-            else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) { /* credit */ }
-            else staffGroups[s].cashCollected += paid;
+            if (/k-net|knet|card|بطاقة|شبكة|link/.test(m)) {
+              groups[groupKey].knetCollected += paid;
+            } else if (/bukey|bouquet|باقة|package|subscription/.test(m)) {
+              groups[groupKey].bukeyCollected += paid;
+            } else if (/unpaid|pending|credit|آجل/.test(m) && !isPaid) {
+              // credit
+            } else {
+              groups[groupKey].cashCollected += paid;
+            }
           }
 
           if (o.paymentStatus === 'Pending' || /credit|آجل|unpaid|pending|غير مدفوع/.test(m)) {
-            staffGroups[s].creditPending += (tot > paid ? tot - paid : tot);
+            groups[groupKey].creditCollected += (tot > paid ? tot - paid : tot);
           } else if (isPartial && tot > paid) {
-            staffGroups[s].creditPending += (tot - paid);
+            groups[groupKey].creditCollected += (tot - paid);
           }
         });
 
-        shiftExpenses.forEach(e => {
-          const s = e.createdBy || 'Staff';
-          if (staffGroups[s] && /cash|نقدي/i.test(e.paymentMethod || '')) {
-            staffGroups[s].cashExpenses += (Number(e.amount) || 0);
+        // Account for cash expenses per staff/shift
+        filteredExpenses.forEach((e) => {
+          const shift = getItemShift(e);
+          const staffName = e.createdBy || 'Staff';
+          const groupKey = `${shift}___${staffName}`;
+          if (groups[groupKey] && /cash|نقدي/i.test(e.paymentMethod || '')) {
+            groups[groupKey].cashExpenses += (Number(e.amount) || 0);
           }
         });
 
-        Object.values(staffGroups).forEach(g => {
+        // Compute netCashInHand for each group
+        Object.values(groups).forEach((g) => {
           g.netCashInHand = Math.max(0, g.cashCollected - g.cashExpenses);
         });
 
-        data = [{
-          shift: parameter || 'All Day',
-          invoicesCount: shiftOrders.length,
-          totalRevenue: shiftOrders.reduce((sum, o) => sum + (o.totalAmount || 0), 0),
-          cashCollected,
-          knetCollected,
-          bukeyCollected,
-          creditCollected,
-          cardCollected: knetCollected,
-          linkCollected: bukeyCollected,
-          totalCollected,
-          totalExpenses,
-          cashExpenses,
-          netCashInHand,
-          bankDepositAmount,
-         staffBreakdown: Object.values(staffGroups),
-         expensesBreakdown: shiftExpenses.map(e => ({
-           id: e._id,
-           title: e.title,
-           amount: e.amount,
-           category: e.category,
-           paymentMethod: e.paymentMethod,
-           time: e.time,
-           createdBy: e.createdBy
-         }))
-       }];
+        // Sort groups: Morning shifts first, then Evening shifts
+        const staffRows = Object.values(groups).sort((a, b) => {
+          if (a.shiftKey === b.shiftKey) return a.staffName.localeCompare(b.staffName);
+          return a.shiftKey === 'Morning' ? -1 : 1;
+        });
+
+        // Calculate Grand Totals across all filtered items
+        const totalInvoices = staffRows.reduce((sum, r) => sum + r.invoicesCount, 0);
+        const totalRevenue = staffRows.reduce((sum, r) => sum + r.totalRevenue, 0);
+        const totalCash = staffRows.reduce((sum, r) => sum + r.cashCollected, 0);
+        const totalKnet = staffRows.reduce((sum, r) => sum + r.knetCollected, 0);
+        const totalBukey = staffRows.reduce((sum, r) => sum + r.bukeyCollected, 0);
+        const totalCredit = staffRows.reduce((sum, r) => sum + r.creditCollected, 0);
+        const totalCashExpenses = staffRows.reduce((sum, r) => sum + r.cashExpenses, 0);
+        const totalNetCash = Math.max(0, totalCash - totalCashExpenses);
+
+        const morningStaffNames = [...new Set(staffRows.filter((r) => r.shiftKey === 'Morning').map((r) => r.staffName))];
+        const eveningStaffNames = [...new Set(staffRows.filter((r) => r.shiftKey === 'Evening').map((r) => r.staffName))];
+
+        const summaryRow = {
+          shift: 'TOTAL',
+          staffName: 'All Counter Staff',
+          invoicesCount: totalInvoices,
+          totalRevenue: totalRevenue,
+          cashCollected: totalCash,
+          knetCollected: totalKnet,
+          bukeyCollected: totalBukey,
+          creditCollected: totalCredit,
+          cashExpenses: totalCashExpenses,
+          netCashInHand: totalNetCash,
+          isTotalRow: true,
+          morningStaff: morningStaffNames,
+          eveningStaff: eveningStaffNames,
+          staffBreakdown: staffRows,
+          expensesBreakdown: filteredExpenses.map((e) => ({
+            id: e._id,
+            title: e.title,
+            amount: e.amount,
+            category: e.category,
+            paymentMethod: e.paymentMethod,
+            time: e.time,
+            createdBy: e.createdBy,
+          })),
+        };
+
+        // Combine staff rows + summary total row
+        data = staffRows.length > 0 ? [...staffRows, summaryRow] : [summaryRow];
     }
     else if (reportType === 'driver_income') {
        let driverQuery = {};
@@ -791,13 +864,23 @@ router.get('/generate', authenticate, requirePermission('view_reports'), async (
        });
     }
     else if (reportType === 'service_revenue') {
+       const dbServices = await LaundryService.find();
        const orders = await Order.find(orderFilter);
        const groups = {};
+       
+       const defaultServices = dbServices.length > 0
+         ? dbServices.map(s => s.name)
+         : ['Normal Ironing', 'Wash & Iron', 'Express Ironing', 'Express Wash & Iron'];
+         
+       defaultServices.forEach(name => {
+         groups[name] = { service: name, count: 0, revenue: 0 };
+       });
+
        orders.forEach(o => {
-         const s = o.serviceType || 'Normal';
+         const s = normalizeServiceName(o.serviceType || o.service, dbServices);
          if (!groups[s]) groups[s] = { service: s, count: 0, revenue: 0 };
          groups[s].count += 1;
-         groups[s].revenue += (o.totalAmount || 0);
+         groups[s].revenue += (Number(o.totalAmount || o.amount) || 0);
        });
        data = Object.values(groups);
     }

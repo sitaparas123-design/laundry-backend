@@ -2,20 +2,17 @@ const Branch = require('../models/Branch');
 
 const seedBranches = async () => {
   try {
+    // Permanently remove Main Branch from database
+    await Branch.deleteMany({
+      name: { $regex: /main branch/i }
+    });
+
     const systemBranches = [
       {
         name: 'Home Service',
         address: 'Central Logistics & Home Delivery Hub',
         phone: '+965 2222 0000',
         email: 'homeservice@tuhama.com',
-        status: 'Active',
-        isSystemBranch: true
-      },
-      {
-        name: 'Main Branch',
-        address: 'Headquarters & Central Processing Unit',
-        phone: '+965 2222 1111',
-        email: 'main@tuhama.com',
         status: 'Active',
         isSystemBranch: true
       }

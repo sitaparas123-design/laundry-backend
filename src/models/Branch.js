@@ -7,6 +7,14 @@ const branchSchema = new mongoose.Schema({
     unique: true,
     trim: true
   },
+  nameAr: {
+    type: String,
+    trim: true
+  },
+  arabicName: {
+    type: String,
+    trim: true
+  },
   address: {
     type: String,
     required: true

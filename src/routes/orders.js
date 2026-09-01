@@ -10,10 +10,19 @@ const notify = require('../utils/notify');
 const router = express.Router();
 
 const formatOrder = (order) => {
+  const isHome = String(order.deliveryType || '').trim().toLowerCase() === 'home delivery';
+  const cust = order.customer && typeof order.customer === 'object' && order.customer._id ? order.customer : null;
+  const custIdStr = cust ? cust._id.toString() : (order.customer ? order.customer.toString() : '');
+  const custNo = cust ? (cust.customerNo || `CUS-${String(cust.displayId || cust._id).slice(-4).toUpperCase()}`) : (order.customerNo || '');
+  const custPhone = cust ? (cust.phone || (cust.phones && cust.phones[0]) || '') : (order.customerPhone || order.contactNumber || '');
+
   return {
     id: order._id.toString(),
     number: order.number,
-    customerId: order.customer ? order.customer.toString() : '',
+    customerId: custIdStr,
+    customerNo: custNo,
+    customerPhone: custPhone,
+    contactNumber: custPhone,
     customerName: order.customerName,
     serviceType: order.serviceType,
     status: order.status,
@@ -24,15 +33,24 @@ const formatOrder = (order) => {
     tax: order.tax,
     totalAmount: order.totalAmount,
     discountAmount: order.discountAmount || 0.0,
+    freeBalanceUsed: order.freeBalanceUsed || 0.0,
     amountPaid: order.amountPaid || 0.0,
     date: order.date,
     pickupDate: order.pickupDate || '',
     deliveryDate: order.deliveryDate || '',
+    expectedDeliveryDate: order.deliveryDate || '',
     expectedDeliveryTime: order.expectedDeliveryTime || '',
-    deliveryType: order.deliveryType,
+    deliveryType: isHome ? 'Home Delivery' : 'Branch Pickup',
+    isHomeDelivery: isHome,
+    deliveryMode: isHome ? 'home' : 'branch',
     notes: order.notes || '',
     createdBy: order.createdBy,
     branchId: order.branchId ? order.branchId.toString() : '',
+    sharedBranches: (order.sharedBranches || []).map(b => b.toString()),
+    transferredTo: order.transferredTo ? order.transferredTo.toString() : null,
+    transferredBranchName: order.transferredBranchName || '',
+    transferredAt: order.transferredAt || null,
+    transferredBy: order.transferredBy || '',
     itemDetails: order.itemDetails.map(item => ({
       name: item.name,
       nameAr: item.nameAr || '',
@@ -147,22 +165,105 @@ router.get('/', authenticate, async (req, res) => {
     const branches = await Branch.find().select('_id');
     const existingBranchIds = branches.map(b => b._id.toString());
 
-    if (selectedBranch) {
-      filter.branchId = selectedBranch;
+    if (selectedBranch && selectedBranch !== 'All') {
+      filter.$or = [
+        { branchId: selectedBranch },
+        { sharedBranches: selectedBranch },
+        { transferredTo: selectedBranch }
+      ];
     } else if (req.activeBranch) {
-      filter.branchId = req.activeBranch._id;
-    } else if (req.user.branch) {
-      filter.branchId = req.user.branch;
+      filter.$or = [
+        { branchId: req.activeBranch._id },
+        { sharedBranches: req.activeBranch._id },
+        { transferredTo: req.activeBranch._id }
+      ];
+    } else if (req.user && req.user.role !== 'Super Admin' && req.user.branch) {
+      filter.$or = [
+        { branchId: req.user.branch },
+        { sharedBranches: req.user.branch },
+        { transferredTo: req.user.branch }
+      ];
     } else {
       filter.branchId = { $in: existingBranchIds };
     }
     
     if (status) filter.status = status;
 
-    const orders = await Order.find(filter).sort({ createdAt: -1 });
+    const orders = await Order.find(filter).populate('customer').sort({ createdAt: -1 });
     res.json(orders.map(formatOrder));
   } catch (error) {
     console.error('Get orders error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// @route   PUT /api/orders/transfer
+// @desc    Transfer/Share orders to another target branch
+router.put('/transfer', authenticate, async (req, res) => {
+  try {
+    const { orderIds, targetBranchId, comment } = req.body;
+    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({ message: 'Order IDs are required' });
+    }
+    if (!targetBranchId) {
+      return res.status(400).json({ message: 'Target branch ID is required' });
+    }
+
+    const targetBranch = await Branch.findById(targetBranchId);
+    if (!targetBranch) {
+      return res.status(404).json({ message: 'Target branch not found' });
+    }
+
+    const { dateStr, timeStr } = getTimelineDateTime();
+    const updatedBy = req.user.name || req.user.username || 'Staff';
+
+    const updatedOrders = [];
+    for (const id of orderIds) {
+      let order = null;
+      if (/^[0-9a-fA-F]{24}$/.test(id)) {
+        order = await Order.findById(id).populate('customer');
+      }
+      if (!order) {
+        order = await Order.findOne({ number: id }).populate('customer');
+      }
+      if (!order) continue;
+
+      if (!order.sharedBranches) order.sharedBranches = [];
+      const hasBranch = order.sharedBranches.some(b => b.toString() === targetBranchId.toString());
+      if (!hasBranch) {
+        order.sharedBranches.push(targetBranch._id);
+      }
+
+      order.transferredTo = targetBranch._id;
+      order.transferredBranchName = targetBranch.name;
+      order.transferredAt = new Date();
+      order.transferredBy = updatedBy;
+
+      order.timeline.push({
+        status: `Sent to ${targetBranch.name}`,
+        date: dateStr,
+        time: timeStr,
+        updatedBy,
+        comment: comment || `Order sent to ${targetBranch.name} branch for processing`
+      });
+
+      await order.save();
+      updatedOrders.push(order);
+    }
+
+    await notify(
+      'Orders Transferred',
+      `${updatedOrders.length} order(s) sent to ${targetBranch.name} by ${updatedBy}.`,
+      'order',
+      targetBranch._id
+    );
+
+    res.json({
+      message: `Successfully sent ${updatedOrders.length} order(s) to ${targetBranch.name}`,
+      orders: updatedOrders.map(formatOrder)
+    });
+  } catch (error) {
+    console.error('Transfer orders error:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
@@ -233,6 +334,7 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
 
     const { dateStr, timeStr } = getTimelineDateTime();
     const orderShift = req.body.shift || (new Date().getHours() < 15 ? 'Morning' : 'Evening');
+    const freeBalanceUsed = Math.max(0, Number(req.body.freeBalanceUsed || 0));
 
     const order = new Order({
       number: orderNumber,
@@ -247,6 +349,7 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
       tax,
       totalAmount,
       discountAmount: discountAmount || 0.0,
+      freeBalanceUsed: freeBalanceUsed,
       amountPaid: paymentStatus === 'Paid' ? parseFloat(totalAmount) : parseFloat(req.body.amountPaid || 0.0),
       date: date || new Date().toISOString().split('T')[0],
       deliveryDate,
@@ -274,9 +377,12 @@ router.post('/', authenticate, requirePermission('create_orders'), async (req, r
       order.branchId || req.user.branch
     );
 
-    // Increment customer loyalty metrics
+    // Increment customer loyalty metrics & deduct free balance
     customer.totalSpent += parseFloat(totalAmount);
     customer.loyaltyPoints += Math.floor(totalAmount); // 1 point per 1 unit spent
+    if (freeBalanceUsed > 0) {
+      customer.freeBalance = Math.max(0, Number(customer.freeBalance || 0) - freeBalanceUsed);
+    }
 
     // Handle payment ledger and outstanding customer balance
     if (order.paymentStatus === 'Pending') {
@@ -441,37 +547,71 @@ router.put('/bulk/status', authenticate, requirePermission(['manage_orders', 'cr
 // @desc    Update order status and append to timeline
 router.put('/:id/status', authenticate, requirePermission(['manage_orders', 'create_orders']), async (req, res) => {
   try {
-    const { status, holdComment } = req.body;
-    if (!status) {
-      return res.status(400).json({ message: 'Status is required.' });
+    const { status, holdComment, deliveryType, deliveryDate, expectedDeliveryTime } = req.body;
+    if (!status && !deliveryType) {
+      return res.status(400).json({ message: 'Status or deliveryType is required.' });
     }
 
-    const order = await Order.findById(req.params.id);
+    let order = null;
+    if (/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+      order = await Order.findById(req.params.id);
+    }
+    if (!order) {
+      order = await Order.findOne({ number: req.params.id });
+    }
     if (!order) {
       return res.status(404).json({ message: 'Order not found.' });
     }
 
     const { dateStr, timeStr } = getTimelineDateTime();
 
-    order.status = status;
-    order.timeline.push({
-      status,
-      date: dateStr,
-      time: timeStr,
-      updatedBy: req.user.name,
-      comment: holdComment || ''
-    });
+    if (status && status !== order.status) {
+      order.status = status;
+      order.timeline.push({
+        status,
+        date: dateStr,
+        time: timeStr,
+        updatedBy: req.user.name,
+        comment: holdComment || (deliveryType ? `Status: ${status}, Delivery: ${deliveryType}` : `Status changed to ${status}`)
+      });
 
-    // If order gets delivered, update payment status if unpaid, or handle delivery completion links
-    if (status === 'Delivered') {
-      order.paymentStatus = 'Paid';
+      // If order gets delivered, update payment status if unpaid, or handle delivery completion links
+      if (status === 'Delivered') {
+        order.paymentStatus = 'Paid';
+      }
+    } else if (holdComment) {
+      order.timeline.push({
+        status: order.status,
+        date: dateStr,
+        time: timeStr,
+        updatedBy: req.user.name,
+        comment: holdComment
+      });
     }
+
+    if (deliveryType !== undefined) {
+      order.deliveryType = String(deliveryType).trim().toLowerCase() === 'home delivery' ? 'Home Delivery' : 'Branch Pickup';
+    } else if (req.body.isHomeDelivery !== undefined) {
+      order.deliveryType = req.body.isHomeDelivery ? 'Home Delivery' : 'Branch Pickup';
+    } else if (req.body.deliveryMode !== undefined) {
+      order.deliveryType = req.body.deliveryMode === 'home' ? 'Home Delivery' : 'Branch Pickup';
+    }
+    if (deliveryDate !== undefined) {
+      order.deliveryDate = deliveryDate;
+    } else if (req.body.expectedDeliveryDate !== undefined) {
+      order.deliveryDate = req.body.expectedDeliveryDate;
+    }
+    if (expectedDeliveryTime !== undefined) order.expectedDeliveryTime = expectedDeliveryTime;
+
+    order.markModified('deliveryType');
+    order.markModified('deliveryDate');
+    order.markModified('expectedDeliveryTime');
 
     await order.save();
 
     await notify(
       'Order Status Updated',
-      `Order ${order.number} status changed to ${status}.`,
+      `Order ${order.number} updated. Status: ${order.status}, Delivery: ${order.deliveryType || 'Branch Pickup'}.`,
       'order',
       order.branchId || req.user.branch
     );
@@ -549,51 +689,82 @@ router.delete('/:id', authenticate, requirePermission('manage_orders'), async (r
 });
 
 // @route   PUT /api/orders/:id/edit
-// @desc    Edit order items (admin only) — add/remove items, update quantities, recalculate totals
+// @desc    Edit order items and delivery mode (admin only) — add/remove items, update quantities, delivery type, recalculate totals
 router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async (req, res) => {
   try {
-    const { itemDetails, notes, serviceType, discountAmount } = req.body;
+    const { itemDetails, notes, serviceType, discountAmount, deliveryType, deliveryDate, expectedDeliveryTime } = req.body;
 
-    if (!itemDetails || !Array.isArray(itemDetails) || itemDetails.length === 0) {
-      return res.status(400).json({ message: 'At least one item is required.' });
+    let order = null;
+    if (/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+      order = await Order.findById(req.params.id);
     }
-
-    const order = await Order.findById(req.params.id);
+    if (!order) {
+      order = await Order.findOne({ number: req.params.id });
+    }
     if (!order) {
       return res.status(404).json({ message: 'Order not found.' });
     }
 
-    // Calculate new amounts
-    const newAmount = itemDetails.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
-    const discount = discountAmount !== undefined ? parseFloat(discountAmount) : (order.discountAmount || 0);
-    const subtotalAfterDiscount = Math.max(0, newAmount - discount);
-    // Preserve tax rate from original order
-    const originalTaxRate = order.amount > 0 ? (order.tax / order.amount) : 0;
-    const newTax = parseFloat((subtotalAfterDiscount * originalTaxRate).toFixed(3));
-    const newTotal = parseFloat((subtotalAfterDiscount + newTax).toFixed(3));
+    let newTotal = order.totalAmount;
+    let oldTotal = order.totalAmount;
+    let oldAmountPaid = order.amountPaid || 0;
 
-    // Track old totals for customer balance adjustment
-    const oldTotal = order.totalAmount;
-    const oldAmountPaid = order.amountPaid || 0;
+    if (itemDetails && Array.isArray(itemDetails) && itemDetails.length > 0) {
+      // Calculate new amounts
+      const newAmount = itemDetails.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
+      const discount = discountAmount !== undefined ? parseFloat(discountAmount) : (order.discountAmount || 0);
+      const subtotalAfterDiscount = Math.max(0, newAmount - discount);
+      // Preserve tax rate from original order
+      const originalTaxRate = order.amount > 0 ? (order.tax / order.amount) : 0;
+      const newTax = parseFloat((subtotalAfterDiscount * originalTaxRate).toFixed(3));
+      newTotal = parseFloat((subtotalAfterDiscount + newTax).toFixed(3));
 
-    // Update order fields
-    order.itemDetails = itemDetails;
-    order.amount = parseFloat(newAmount.toFixed(3));
-    order.tax = newTax;
-    order.totalAmount = newTotal;
-    order.discountAmount = discount;
+      // Update order fields
+      order.itemDetails = itemDetails;
+      order.amount = parseFloat(newAmount.toFixed(3));
+      order.tax = newTax;
+      order.totalAmount = newTotal;
+      order.discountAmount = discount;
+
+      // Adjust amountPaid if it exceeds new total
+      if (order.amountPaid > newTotal) {
+        order.amountPaid = newTotal;
+        order.paymentStatus = 'Paid';
+      }
+    } else if (discountAmount !== undefined) {
+      const discount = parseFloat(discountAmount);
+      const subtotalAfterDiscount = Math.max(0, order.amount - discount);
+      const originalTaxRate = order.amount > 0 ? (order.tax / order.amount) : 0;
+      const newTax = parseFloat((subtotalAfterDiscount * originalTaxRate).toFixed(3));
+      newTotal = parseFloat((subtotalAfterDiscount + newTax).toFixed(3));
+      order.tax = newTax;
+      order.totalAmount = newTotal;
+      order.discountAmount = discount;
+    }
+
     if (notes !== undefined) order.notes = notes;
     if (serviceType) order.serviceType = serviceType;
+    if (deliveryType !== undefined) {
+      order.deliveryType = String(deliveryType).trim().toLowerCase() === 'home delivery' ? 'Home Delivery' : 'Branch Pickup';
+    } else if (req.body.isHomeDelivery !== undefined) {
+      order.deliveryType = req.body.isHomeDelivery ? 'Home Delivery' : 'Branch Pickup';
+    } else if (req.body.deliveryMode !== undefined) {
+      order.deliveryType = req.body.deliveryMode === 'home' ? 'Home Delivery' : 'Branch Pickup';
+    }
+    if (deliveryDate !== undefined) {
+      order.deliveryDate = deliveryDate;
+    } else if (req.body.expectedDeliveryDate !== undefined) {
+      order.deliveryDate = req.body.expectedDeliveryDate;
+    }
+    if (expectedDeliveryTime !== undefined) order.expectedDeliveryTime = expectedDeliveryTime;
+
+    order.markModified('deliveryType');
+    order.markModified('deliveryDate');
+    order.markModified('expectedDeliveryTime');
 
     order.isEdited = true;
     order.editedAt = new Date();
     order.editedBy = req.user.name;
-
-    // Adjust amountPaid if it exceeds new total
-    if (order.amountPaid > newTotal) {
-      order.amountPaid = newTotal;
-      order.paymentStatus = 'Paid';
-    }
 
     // Add timeline entry for edit
     const { dateStr, timeStr } = getTimelineDateTime();
@@ -602,7 +773,7 @@ router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async 
       date: dateStr,
       time: timeStr,
       updatedBy: req.user.name,
-      comment: `Invoice edited by admin — Items updated, Total: ${newTotal.toFixed(3)}`
+      comment: `Invoice edited by admin — Delivery: ${order.deliveryType || 'Branch Pickup'}, Total: ${newTotal.toFixed(3)}`
     });
 
     await order.save();
@@ -620,7 +791,7 @@ router.put('/:id/edit', authenticate, requirePermission('manage_orders'), async 
 
     await notify(
       'Invoice Edited',
-      `Invoice ${order.number} was edited by ${req.user.name}. New total: ${newTotal.toFixed(3)}.`,
+      `Invoice ${order.number} was edited by ${req.user.name}. Delivery: ${order.deliveryType || 'Branch Pickup'}, New total: ${newTotal.toFixed(3)}.`,
       'order',
       order.branchId || req.user.branch
     );
